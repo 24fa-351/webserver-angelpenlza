@@ -2,145 +2,141 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/socket.h>
 #include <pthread.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
-#include <sys/stat.h>
-#include <dirent.h>
 
-//====================================================================
-//====================================================================
-
-void send_response(int client_socket, const char *header, const char *content) {
-    char response[1024];
-    snprintf(response, sizeof(response), "%s\n\n%s", header, content);
-    send(client_socket, response, strlen(response), 0);
-}
-
-//====================================================================
-//====================================================================
-
-void *client(void* cfd) {
-
-    // variables
-    int client_fd = *(int*)cfd;
-    char buffer[1024] = {0};
-    int buffsize = sizeof(buffer);
-
-    // receive client info
-    int bytes_recv = recv(client_fd, buffer, buffsize - 1, 0);
-    if(bytes_recv < 0) {
-        perror("failed to receive\n");
-        return NULL;
-    }
-    buffer[bytes_recv] = '\0';
-
-    // parse GET request path
-    char method[1024];
-    char path[1024];
-    sscanf(buffer, "%s %s", method, path);
-
-    // remove the leading '/'
-    char* directory = path + 1;
-    
-    // check to see if directory exists (using stat)
-    struct stat dir_info;
-    if(stat(directory, &dir_info) == 0 && S_ISDIR(dir_info.st_mode)) {
-        DIR* dir = opendir(directory);
-        if(dir == NULL) {
-            send_response(client_fd, "HTTP/1.1 Internal Service Error", "unable to read directory");
-        } else {
-            struct dirent *entry;
-            char content[1024] = " ";
-            while((entry = readdir(dir)) != NULL) {
-                strcat(content, entry->d_name);
-                strcat(content, "\n");
-            }
-            closedir(dir);
-            send_response(client_fd, "HTTP/1.1 200 OK", content);
-        }
-    } else {
-        send_response(client_fd, "HTTP/1.1 404 Not Found", "directory does not exist\n");
-    }
+char* get_directory(const char* request) {
 
     return NULL;
 }
 
-//====================================================================
-//====================================================================
+char* get_page(const char* fname) {
 
-void create_server(int port) {
+    // open the file
+    FILE* page = fopen(fname, "r");
+    if(page == NULL) {
+        printf("error reading file\n");
+        fclose(page);
+        return NULL;
+    }
+
+    // get the size of the page
+    fseek(page, 0, SEEK_END);
+    int size = ftell(page);
+    rewind(page);
+
+    // read the page, copy its contents, add null terminator
+    char* content = (char*)malloc(size + 1);
+    if(content == NULL) {
+        fclose(page);
+        return NULL;
+    }
+    fread(content, 1, size, page);
+    content[size] = '\0';
+
+    // create header
+    char header[80];
+    snprintf(header, sizeof(header), 
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html\r\n"
+            "Connection: close\r\n"
+            "Content-Length: %d\r\n"
+            "\r\n", size);
+    
+    char* request = (char*)malloc(sizeof(char)*(74 + size)); // size of page + size of content
+    strcpy(request, header);
+    strcat(request, content);
+
+    // end
+    free(content);
+    fclose(page);
+    return request;
+}
+
+void* handle_request(void* cfd) {
 
     // variables
-    int server_fd;
-    int client_fd;
+    int client_fd = *(int*)cfd;
+    char* request = get_page("static/home.html");
+    char user_input[1024];
+
+    // handle invalid request
+    if(request == NULL) {
+        request = 
+            "HTML/1.1 404 Not Found\r\n"
+            "Content-Type: text/html\r\n"
+            "Connection: close\r\n"
+            "Content-Length: 13\r\n"
+            "\r\n"
+            "<h1>404</h1>";
+    }
+
+    read(client_fd, user_input, 1024);
+    printf("user sent: %s\n", user_input);
+
+    write(client_fd, request, strlen(request));
+    close(client_fd);
+    return NULL;
+}
+
+int main(int argc, char* argv[]) {
+
+    // variables 
+    int server_fd, client_fd;
+    int port = 80;
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
     pthread_t tid;
 
-    // create socket
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if(server_fd == 0) {
-        perror("failed to create socket\n");
-        return;
+    // update port, if specified
+    if(argc > 2) {
+        if(strcmp(argv[1], "-p") != 0) {
+            printf("invalid flag\n");
+            exit(1);
+        } else {
+            port = atoi(argv[2]);
+        }
     }
 
-    // set addr values
+    // create the server socket
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if(server_fd < 0) {
+        perror("error creating server\n");
+        exit(1);
+    }
+
+    // config addr values
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
 
     // bind
-    if(bind(server_fd, (struct sockaddr*)&addr, addrlen)) {
-        perror("failed to bind\n");
-        return;
+    if(bind(server_fd, (struct sockaddr*)&addr, addrlen) < 0) {
+        perror("error binding\n");
+        exit(1);
     }
 
-    // listen
-    if(listen(server_fd, 10) < 0) {
-        perror("failed to listen\n");
-        return;
+    // start listening
+    if(listen(server_fd, 3) < 0) {
+        perror("error listening\n");
+        exit(1);
     }
 
-    printf("server is listening on port %d\n", port);
-    // handle the client input, with multithreading
+    printf("server running on port %d\n", port);
+    // accept requests
     while(server_fd > 0) {
         client_fd = accept(server_fd, (struct sockaddr*)&addr, &addrlen);
         if(client_fd < 0) {
-            perror("failed to accept\n");
-            break;
+            perror("error accepting\n");
+            exit(1);
         }
-        pthread_create(&tid, NULL, client, (void*)&client_fd);
+        pthread_create(&tid, NULL, handle_request, (void*)&client_fd);
         pthread_join(tid, NULL);
     }
 
+    // close the server
     close(server_fd);
-    close(client_fd);
-
-}
-
-//====================================================================
-//====================================================================
-
-int main(int argc, char* argv[]) {
-
-    // variables 
-    int port = 80;
-
-    // get port, if specified
-    if(argc > 2) {
-        if(strcmp(argv[1], "-p") != 0) {
-            printf("invalid flag\n");
-            exit(1);
-        } else
-            port = atoi(argv[2]);
-    }
-
-    // create server
-    create_server(port);
-
+    
     return 0;
 }
-
-//====================================================================
-//====================================================================
